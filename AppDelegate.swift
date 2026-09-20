@@ -125,7 +125,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         testClickItem.target = self
         menu.addItem(testClickItem)
 
-        let gesturesItem = NSMenuItem(title: "Double Tap + Hold: Select/Drag • Two-Finger Tap: Right Click", action: nil, keyEquivalent: "")
+        let gesturesItem = NSMenuItem(title: "Double Tap + Hold: Select/Drag • Swipe: Zoom • Two-Finger Tap: Right Click", action: nil, keyEquivalent: "")
         gesturesItem.isEnabled = false
         menu.addItem(gesturesItem)
 
@@ -296,6 +296,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        manager.onZoomGesture = { [weak self] zoomIn in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.synthesizeZoom(zoomIn: zoomIn)
+                self.diagnosticsStatusItem?.title = zoomIn
+                    ? "Status: Zoom in sent"
+                    : "Status: Zoom out sent"
+            }
+        }
         manager.start()
     }
 
@@ -353,11 +362,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if type == .scrollWheel {
+            if multitouchManager?.isSelectionDragging == true ||
+                multitouchManager?.isSecondTapPending == true ||
+                multitouchManager?.isZoomGestureActive == true {
+                return nil
+            }
             multitouchManager?.noteScrollEvent()
             return Unmanaged.passUnretained(event)
         }
 
-        guard type == .mouseMoved, multitouchManager?.isSelectionDragging == true else {
+        guard type == .mouseMoved else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        if let location = multitouchManager?.promotePendingSecondTapToSelectionDrag(
+            currentLocation: event.location
+        ) {
+            setDragEventTapEnabled(true)
+            synthesizeSelectionDrag(at: location, isDragging: true)
+            diagnosticsStatusItem?.title = "Status: Selection/drag active"
+        }
+
+        guard multitouchManager?.isSelectionDragging == true else {
             return Unmanaged.passUnretained(event)
         }
 
@@ -453,6 +479,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             event.setIntegerValueField(.mouseEventClickState, value: 2)
             event.post(tap: .cghidEventTap)
         }
+    }
+
+    /// Sends the standard macOS application zoom shortcuts: Command-minus to zoom out and
+    /// Command-plus (Command-Shift-equals) to zoom in.
+    func synthesizeZoom(zoomIn: Bool) {
+        let keyCode: CGKeyCode = zoomIn ? 24 : 27
+        var flags: CGEventFlags = .maskCommand
+        if zoomIn {
+            flags.insert(.maskShift)
+        }
+
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+            return
+        }
+        keyDown.flags = flags
+        keyUp.flags = flags
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
     }
 
     private func updateDragLockStatus(isLocked: Bool) {

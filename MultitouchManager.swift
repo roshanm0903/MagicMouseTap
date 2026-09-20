@@ -5,7 +5,7 @@ import AppKit
 // Swift wrapper for Multitouch framework
 class MultitouchManager {
     private var devices: [MTDeviceRef] = []
-    private var tapDetector = TapDetector(tapTimeThreshold: 0.22, tapMovementThreshold: 0.08)
+    private var tapDetector = TapDetector(tapTimeThreshold: 0.30, tapMovementThreshold: 0.08)
     private var twoFingerTapDetector = TwoFingerTapDetector(tapTimeThreshold: 0.35, movementThreshold: 0.12)
     private var isEnabled = true
     private var isSelectionDragAvailable = false
@@ -14,8 +14,8 @@ class MultitouchManager {
     private var touchStartY: Float = 0.0
     private var surfaceMovementThreshold: Float = 0.04  // 4% of surface; scrolling must never become a tap
     private var suppressSingleTouchUntilLift = false
-    private let doubleTapTimeThreshold: TimeInterval = 0.40
-    private let doubleTapCursorDistanceThreshold: CGFloat = 30.0
+    private let doubleTapTimeThreshold: TimeInterval = 0.55
+    private let doubleTapCursorDistanceThreshold: CGFloat = 45.0
     private var lastSingleTapTimestamp: TimeInterval?
     private var lastSingleTapLocation: CGPoint?
     private let scrollStateLock = NSLock()
@@ -28,6 +28,8 @@ class MultitouchManager {
     private var pendingClickSerial: UInt64 = 0
     private var pendingSingleClick: (serial: UInt64, location: CGPoint, scrollGeneration: UInt64)?
     private let postReleaseScrollGuardDelay: TimeInterval = 0.12
+    private let zoomSwipeThreshold: Float = 0.035
+    private let selectionDragCursorThreshold: CGFloat = 6.0
 
     /// Taps with a normalized x above this are right clicks. Configurable from the menu bar.
     var rightClickThreshold: Float = Preferences.rightClickThreshold {
@@ -40,9 +42,13 @@ class MultitouchManager {
 
     var onClickSynthesized: ((CGPoint, Bool, Int64) -> Void)?
     var onSelectionDragChanged: ((CGPoint, Bool) -> Void)?
+    var onZoomGesture: ((Bool) -> Void)?
     var onDeviceCountChanged: ((Int) -> Void)?
     var onTouchInputDetected: (() -> Void)?
     private(set) var isSelectionDragging = false
+    private(set) var isSecondTapPending = false
+    private(set) var isZoomGestureActive = false
+    private var pendingSecondTapLocation: CGPoint?
     private var hasReportedTouchInput = false
 
     init() {
@@ -122,6 +128,18 @@ class MultitouchManager {
             onTouchInputDetected?()
         }
 
+        // Once a zoom swipe fires, consume every remaining frame (and native scroll event)
+        // until the finger lifts so the gesture cannot turn into a click or content scroll.
+        if isZoomGestureActive {
+            if numTouches == 0 {
+                isZoomGestureActive = false
+                twoFingerTapDetector.reset()
+                cancelSingleTouchTracking()
+                DiagnosticLog.write("zoom gesture completed on finger lift")
+            }
+            return
+        }
+
         let surfaceTouches = (0..<numTouches).map { index in
             let touch = touches[index]
             return SurfaceTouch(
@@ -153,8 +171,24 @@ class MultitouchManager {
             break
         }
 
-        // During the second touch of a double-tap, keep the primary button held until that
-        // finger lifts. Physical mouse movement is converted to leftMouseDragged by AppDelegate.
+        // Keep the second tap undecided until its intent is clear. A surface swipe becomes zoom;
+        // physical mouse movement promotes it to selection/drag; lifting becomes a double click.
+        // This prevents a zoom gesture from briefly selecting text before it is recognized.
+        if isSecondTapPending {
+            if numTouches == 0 {
+                finishPendingSecondTapAsDoubleClick()
+                cancelSingleTouchTracking()
+            } else if numTouches > 1 {
+                cancelPendingSecondTap()
+                cancelSingleTouchTracking()
+            } else {
+                recognizeZoomSwipeIfNeeded(touches[0])
+            }
+            return
+        }
+
+        // During an actual selection drag, keep the primary button held until the finger lifts.
+        // Physical mouse movement is converted to leftMouseDragged by AppDelegate.
         if isSelectionDragging {
             if numTouches == 0 {
                 finishSelectionDrag()
@@ -371,9 +405,57 @@ class MultitouchManager {
         lastSingleTapTimestamp = nil
         lastSingleTapLocation = nil
         tapDetector.reset()
+        isSecondTapPending = true
+        pendingSecondTapLocation = location
+        DiagnosticLog.write("double tap second touch began; awaiting zoom or physical drag intent")
+    }
+
+    private func recognizeZoomSwipeIfNeeded(_ touch: MTTouch) {
+        guard touch.identifier == activeTouch else { return }
+
+        let deltaX = touch.normalized.position.x - touchStartX
+        let deltaY = touch.normalized.position.y - touchStartY
+        guard abs(deltaY) >= zoomSwipeThreshold,
+              abs(deltaY) > abs(deltaX) * 1.05 else { return }
+
+        // MultitouchSupport's normalized Y coordinate increases toward the front/top of the
+        // mouse. Per the requested mapping: swipe up zooms out; swipe down zooms in.
+        let zoomIn = deltaY < 0
+        cancelPendingSecondTap()
+        isZoomGestureActive = true
+        activeTouch = -1
+        tapDetector.reset()
+        DiagnosticLog.write(zoomIn
+            ? "double-tap hold + swipe down recognized; zoom in"
+            : "double-tap hold + swipe up recognized; zoom out")
+        onZoomGesture?(zoomIn)
+    }
+
+    /// Called by AppDelegate when the physical mouse moves while the second tap is held.
+    /// Returning the original cursor location lets it post mouse-down before transforming the
+    /// same movement event into a drag, preserving correct event order.
+    func promotePendingSecondTapToSelectionDrag(currentLocation: CGPoint) -> CGPoint? {
+        guard isSecondTapPending, let location = pendingSecondTapLocation else { return nil }
+        let distance = hypot(currentLocation.x - location.x, currentLocation.y - location.y)
+        guard distance >= selectionDragCursorThreshold else { return nil }
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
         isSelectionDragging = true
-        DiagnosticLog.write("double tap second touch began; selection/drag mouse-down")
-        onSelectionDragChanged?(location, true)
+        DiagnosticLog.write("double tap hold + deliberate physical mouse movement; selection/drag mouse-down")
+        return location
+    }
+
+    private func finishPendingSecondTapAsDoubleClick() {
+        guard isSecondTapPending, let location = pendingSecondTapLocation else { return }
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
+        DiagnosticLog.write("double tap released without drag; second click sent")
+        onClickSynthesized?(location, false, 2)
+    }
+
+    private func cancelPendingSecondTap() {
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
     }
 
     private func finishSelectionDrag() {
@@ -385,6 +467,7 @@ class MultitouchManager {
     }
 
     private func releaseSelectionDrag() {
+        cancelPendingSecondTap()
         finishSelectionDrag()
     }
 
@@ -394,6 +477,8 @@ class MultitouchManager {
         cancelSingleTouchTracking()
         lastSingleTapTimestamp = nil
         lastSingleTapLocation = nil
+        cancelPendingSecondTap()
+        isZoomGestureActive = false
         touchStartedDuringScroll = false
         suppressSingleTouchUntilLift = false
     }

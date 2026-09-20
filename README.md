@@ -7,6 +7,7 @@ A small personal macOS menu-bar utility that adds trackpad-style gestures to an 
 - One-finger tap: left click
 - Double tap: double click/select
 - Double tap and hold the second tap: select text or drag and drop
+- While holding the second tap, swipe up to zoom out or down to zoom in
 - Two-finger tap: right click
 - Scroll gestures never generate a click
 - A tap used to stop inertial scrolling is consumed and does not click

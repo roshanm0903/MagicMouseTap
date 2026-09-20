@@ -1,0 +1,17 @@
+# Swift Package Manager (for tests)
+.build/
+*.swiftpm
+
+# macOS
+.DS_Store
+._*
+
+# Release artifacts (attached to GitHub releases, not committed)
+dist/
+build/
+
+# Logs
+*.log
+
+# Claude Code
+.claude/

@@ -1,0 +1,575 @@
+import Foundation
+import CoreGraphics
+import AppKit
+
+// Swift wrapper for Multitouch framework
+class MultitouchManager {
+    private var devices: [MTDeviceRef] = []
+    // MTDeviceCreateList owns the device handles it contains. Keep the list alive for as long
+    // as callbacks are registered; otherwise a later wake/reconnect can call MTDeviceStop on a
+    // handle whose owning CFArray has already been released.
+    private var retainedDeviceList: CFArray?
+    private var tapDetector = TapDetector(
+        tapTimeThreshold: Preferences.effectiveTapDuration,
+        tapMovementThreshold: CGFloat(Preferences.effectiveCursorMovementTolerance)
+    )
+    private var twoFingerTapDetector = TwoFingerTapDetector(tapTimeThreshold: 0.35, movementThreshold: 0.12)
+    private var isEnabled = true
+    private var isSelectionDragAvailable = false
+    private var activeTouch: Int32 = -1
+    private var touchStartX: Float = 0.0
+    private var touchStartY: Float = 0.0
+    private var surfaceMovementThreshold = Float(Preferences.effectiveSurfaceMovementTolerance)
+    private var suppressSingleTouchUntilLift = false
+    private var doubleTapTimeThreshold: TimeInterval = Preferences.doubleTapInterval
+    private let doubleTapCursorDistanceThreshold: CGFloat = 45.0
+    private var lastSingleTapTimestamp: TimeInterval?
+    private var lastSingleTapLocation: CGPoint?
+    private let scrollStateLock = NSLock()
+    private var scrollEventGeneration: UInt64 = 0
+    private var lastScrollEventUptime: TimeInterval = -.infinity
+    private var touchStartScrollGeneration: UInt64 = 0
+    private var touchStartedDuringScroll = false
+    private var scrollStopTapWindow: TimeInterval = Preferences.scrollStopWindow
+    private let pendingClickLock = NSLock()
+    private var pendingClickSerial: UInt64 = 0
+    private var pendingSingleClick: (serial: UInt64, location: CGPoint, scrollGeneration: UInt64)?
+    private let postReleaseScrollGuardDelay: TimeInterval = 0.12
+    private var zoomSwipeThreshold = Float(Preferences.zoomSwipeDistance)
+    private var selectionDragCursorThreshold = CGFloat(Preferences.dragStartDistance)
+
+    /// Taps with a normalized x above this are right clicks. Configurable from the menu bar.
+    var rightClickThreshold: Float = Preferences.rightClickThreshold {
+        didSet {
+            rightClickThreshold = Preferences.clamp(rightClickThreshold)
+        }
+    }
+
+    fileprivate static var sharedInstance: MultitouchManager?
+
+    var onClickSynthesized: ((CGPoint, Bool, Int64) -> Void)?
+    var onSelectionDragChanged: ((CGPoint, Bool) -> Void)?
+    var onZoomGesture: ((Bool) -> Void)?
+    var onDeviceCountChanged: ((Int) -> Void)?
+    var onTouchInputDetected: (() -> Void)?
+    private(set) var isSelectionDragging = false
+    private(set) var isSecondTapPending = false
+    private(set) var isZoomGestureActive = false
+    private var pendingSecondTapLocation: CGPoint?
+    private var hasReportedTouchInput = false
+
+    var registeredDeviceCount: Int {
+        devices.count
+    }
+
+    /// Polls the current MultitouchSupport device list without attaching callbacks. This lets
+    /// AppDelegate detect Bluetooth disconnect/reconnect even when the stale device handle no
+    /// longer emits touch frames.
+    static func availableExternalDeviceCount() -> Int {
+        guard let deviceList = MTDeviceCreateList() else { return 0 }
+        let deviceArray = deviceList.takeRetainedValue() as NSArray
+        let count = CFArrayGetCount(deviceArray)
+        var externalCount = 0
+
+        for index in 0..<count {
+            let device = unsafeBitCast(
+                CFArrayGetValueAtIndex(deviceArray, index),
+                to: MTDeviceRef.self
+            )
+            if !MTDeviceIsBuiltIn(device) {
+                externalCount += 1
+            }
+        }
+        return externalCount
+    }
+
+    init() {
+        MultitouchManager.sharedInstance = self
+    }
+
+    func start() {
+        guard devices.isEmpty, retainedDeviceList == nil else {
+            DiagnosticLog.write("multitouch start ignored; listener is already active")
+            return
+        }
+
+        guard let deviceList = MTDeviceCreateList() else {
+            DiagnosticLog.write("MTDeviceCreateList returned nil")
+            onDeviceCountChanged?(0)
+            return
+        }
+
+        let deviceArray = deviceList.takeRetainedValue()
+        retainedDeviceList = deviceArray
+        let count = CFArrayGetCount(deviceArray)
+
+        for i in 0..<count {
+            let device = unsafeBitCast(CFArrayGetValueAtIndex(deviceArray, i), to: MTDeviceRef.self)
+
+            // Only monitor external devices (Magic Mouse), skip built-in trackpads
+            let isBuiltIn = MTDeviceIsBuiltIn(device)
+
+            if !isBuiltIn {
+                devices.append(device)
+                MTRegisterContactFrameCallback(device, touchCallback)
+                MTDeviceStart(device, 0)
+            }
+        }
+        DiagnosticLog.write("multitouch started; external devices=\(devices.count), total devices=\(count)")
+        onDeviceCountChanged?(devices.count)
+    }
+
+    func stop() {
+        if MultitouchManager.sharedInstance === self {
+            // Ignore any callback already queued by the private framework while it shuts down.
+            MultitouchManager.sharedInstance = nil
+        }
+
+        releaseSelectionDrag()
+        resetTouchTracking()
+
+        let activeDevices = devices
+        devices.removeAll()
+
+        for device in activeDevices {
+            MTUnregisterContactFrameCallback(device, touchCallback)
+            MTDeviceStop(device)
+        }
+
+        // Release the list only after every owned device has been stopped.
+        retainedDeviceList = nil
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        if !enabled {
+            releaseSelectionDrag()
+            resetTouchTracking()
+        }
+        isEnabled = enabled
+    }
+
+    func setSelectionDragAvailable(_ available: Bool) {
+        if !available {
+            DiagnosticLog.write("mouse-move drag transformer unavailable; using button-hold fallback")
+        }
+        isSelectionDragAvailable = available
+    }
+
+    /// Applies persisted settings immediately. Cancel any gesture currently in progress so a
+    /// threshold cannot change halfway through a touch sequence.
+    func reloadGesturePreferences() {
+        releaseSelectionDrag()
+        resetTouchTracking()
+        tapDetector = TapDetector(
+            tapTimeThreshold: Preferences.effectiveTapDuration,
+            tapMovementThreshold: CGFloat(Preferences.effectiveCursorMovementTolerance)
+        )
+        surfaceMovementThreshold = Float(Preferences.effectiveSurfaceMovementTolerance)
+        doubleTapTimeThreshold = Preferences.doubleTapInterval
+        zoomSwipeThreshold = Float(Preferences.zoomSwipeDistance)
+        selectionDragCursorThreshold = CGFloat(Preferences.dragStartDistance)
+        scrollStopTapWindow = Preferences.scrollStopWindow
+        DiagnosticLog.write(
+            "gesture sensitivity updated; sensitivity=\(Preferences.tapSensitivity), " +
+            "tap=\(Preferences.effectiveTapDuration)s, " +
+            "surface=\(Preferences.effectiveSurfaceMovementTolerance), " +
+            "double=\(Preferences.doubleTapInterval)s, zoom=\(Preferences.zoomSwipeDistance), " +
+            "drag=\(Preferences.dragStartDistance)px, scrollStop=\(Preferences.scrollStopWindow)s"
+        )
+    }
+
+    /// Called by the always-on scroll-wheel event tap. Any native scroll generated during a
+    /// contact sequence disqualifies that sequence from becoming a click.
+    func noteScrollEvent() {
+        scrollStateLock.lock()
+        scrollEventGeneration &+= 1
+        lastScrollEventUptime = ProcessInfo.processInfo.systemUptime
+        scrollStateLock.unlock()
+    }
+
+    func processTouches(_ touches: UnsafeMutablePointer<MTTouch>, numTouches: Int, timestamp: Double) {
+        guard isEnabled else { return }
+
+        // The callback comes from a private framework; don't trust a negative count.
+        guard numTouches >= 0 else { return }
+
+        if numTouches > 0 && !hasReportedTouchInput {
+            hasReportedTouchInput = true
+            DiagnosticLog.write("first touch frame received; touches=\(numTouches)")
+            onTouchInputDetected?()
+        }
+
+        // Once a zoom swipe fires, consume every remaining frame (and native scroll event)
+        // until the finger lifts so the gesture cannot turn into a click or content scroll.
+        if isZoomGestureActive {
+            if numTouches == 0 {
+                isZoomGestureActive = false
+                twoFingerTapDetector.reset()
+                cancelSingleTouchTracking()
+                DiagnosticLog.write("zoom gesture completed on finger lift")
+            }
+            return
+        }
+
+        let surfaceTouches = (0..<numTouches).map { index in
+            let touch = touches[index]
+            return SurfaceTouch(
+                identifier: touch.identifier,
+                position: CGPoint(
+                    x: CGFloat(touch.normalized.position.x),
+                    y: CGFloat(touch.normalized.position.y)
+                )
+            )
+        }
+        let twoFingerResult = twoFingerTapDetector.process(
+            touches: surfaceTouches,
+            timestamp: timestamp
+        )
+
+        switch twoFingerResult {
+        case .recognized:
+            cancelSingleTouchTracking()
+            lastSingleTapTimestamp = nil
+            lastSingleTapLocation = nil
+            let location = CGEvent(source: nil)?.location ?? CGPoint.zero
+            DiagnosticLog.write("two-finger tap recognized; right click")
+            onClickSynthesized?(location, true, 1)
+            return
+        case .rejectedMultiTouchGesture:
+            cancelSingleTouchTracking()
+            return
+        case .none:
+            break
+        }
+
+        // Keep the second tap undecided until its intent is clear. A surface swipe becomes zoom;
+        // physical mouse movement promotes it to selection/drag; lifting becomes a double click.
+        // This prevents a zoom gesture from briefly selecting text before it is recognized.
+        if isSecondTapPending {
+            if numTouches == 0 {
+                finishPendingSecondTapAsDoubleClick()
+                cancelSingleTouchTracking()
+            } else if numTouches > 1 {
+                cancelPendingSecondTap()
+                cancelSingleTouchTracking()
+            } else {
+                recognizeZoomSwipeIfNeeded(touches[0])
+            }
+            return
+        }
+
+        // During an actual selection drag, keep the primary button held until the finger lifts.
+        // Physical mouse movement is converted to leftMouseDragged by AppDelegate.
+        if isSelectionDragging {
+            if numTouches == 0 {
+                finishSelectionDrag()
+                cancelSingleTouchTracking()
+            } else if numTouches > 1 {
+                // Never leave the synthetic button held if another finger joins the gesture.
+                finishSelectionDrag()
+                twoFingerTapDetector.reset()
+                cancelSingleTouchTracking()
+            }
+            return
+        }
+
+        // Once a second finger has participated, wait for every finger to lift. Otherwise the
+        // last remaining finger could be mistaken for a fresh one-finger click.
+        if twoFingerTapDetector.suppressesSingleFingerTap {
+            cancelSingleTouchTracking()
+            return
+        }
+
+        if numTouches == 0 {
+            if activeTouch != -1 {
+                // Get cursor position directly from CGEvent (already in correct coordinate space)
+                let cgLocation = CGEvent(source: nil)?.location ?? CGPoint.zero
+
+                if let tapLocation = tapDetector.touchEnded(at: cgLocation) {
+                    guard !touchStartedDuringScroll,
+                          !nativeScrollOccurred(since: touchStartScrollGeneration) else {
+                        DiagnosticLog.write("tap rejected because it occurred during or stopped scrolling")
+                        lastSingleTapTimestamp = nil
+                        lastSingleTapLocation = nil
+                        activeTouch = -1
+                        touchStartX = 0.0
+                        touchStartY = 0.0
+                        touchStartedDuringScroll = false
+                        suppressSingleTouchUntilLift = false
+                        return
+                    }
+                    recordSingleTap(at: tapLocation, timestamp: timestamp)
+                    scheduleSingleClick(at: tapLocation)
+                }
+                activeTouch = -1
+                touchStartX = 0.0
+                touchStartY = 0.0
+            }
+            touchStartedDuringScroll = false
+            suppressSingleTouchUntilLift = false
+            return
+        }
+
+        if numTouches == 1 {
+            // A scrolling/moving finger remains suppressed for its whole contact sequence. Without
+            // this latch, later frames from the same finger could be mistaken for a fresh tap.
+            guard !suppressSingleTouchUntilLift else { return }
+
+            let touch = touches[0]
+            // Get cursor position directly from CGEvent (already in correct coordinate space)
+            let cgLocation = CGEvent(source: nil)?.location ?? CGPoint.zero
+
+            if touch.state == 4 || touch.state == 7 {
+                if activeTouch == -1 {
+                    // New touch started - record starting position on surface
+                    activeTouch = touch.identifier
+                    touchStartX = touch.normalized.position.x
+                    touchStartY = touch.normalized.position.y
+                    touchStartScrollGeneration = currentScrollGeneration()
+                    touchStartedDuringScroll = wasScrollingRecently()
+                    if touchStartedDuringScroll {
+                        DiagnosticLog.write("touch began during scroll cooldown; it will only stop scrolling")
+                    }
+                    if isSecondTapCandidate(at: cgLocation, timestamp: timestamp) {
+                        beginSelectionDrag(at: cgLocation)
+                    } else {
+                        tapDetector.touchBegan(at: cgLocation)
+                    }
+                } else if activeTouch == touch.identifier {
+                    if isSelectionDragging {
+                        return
+                    }
+                    // Same touch continuing - check if finger moved too much on surface (scrolling)
+                    let deltaX = abs(touch.normalized.position.x - touchStartX)
+                    let deltaY = abs(touch.normalized.position.y - touchStartY)
+                    let surfaceMovement = max(deltaX, deltaY)
+
+                    if surfaceMovement > surfaceMovementThreshold {
+                        // Finger moved too much on surface - likely scrolling, cancel tap
+                        DiagnosticLog.write("single-finger gesture suppressed until lift; surface movement=\(surfaceMovement)")
+                        suppressSingleTouchUntilLift = true
+                        tapDetector.reset()
+                        activeTouch = -1
+                        touchStartX = 0.0
+                        touchStartY = 0.0
+                    } else {
+                        // Check cursor movement too (physical mouse movement cancels tap)
+                        let moved = tapDetector.touchMoved(to: cgLocation)
+                        if moved {
+                            DiagnosticLog.write("single-finger gesture suppressed until lift; cursor moved")
+                            suppressSingleTouchUntilLift = true
+                            activeTouch = -1
+                            touchStartX = 0.0
+                            touchStartY = 0.0
+                        }
+                    }
+                }
+            }
+        } else if numTouches > 1 {
+            cancelSingleTouchTracking()
+        }
+    }
+
+    private func isSecondTapCandidate(at location: CGPoint, timestamp: TimeInterval) -> Bool {
+        if let previousTimestamp = lastSingleTapTimestamp,
+           let previousLocation = lastSingleTapLocation {
+            let elapsed = timestamp - previousTimestamp
+            let distance = hypot(location.x - previousLocation.x, location.y - previousLocation.y)
+            if elapsed >= 0,
+               elapsed <= doubleTapTimeThreshold,
+               distance <= doubleTapCursorDistanceThreshold {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func currentScrollGeneration() -> UInt64 {
+        scrollStateLock.lock()
+        defer { scrollStateLock.unlock() }
+        return scrollEventGeneration
+    }
+
+    private func nativeScrollOccurred(since generation: UInt64) -> Bool {
+        scrollStateLock.lock()
+        defer { scrollStateLock.unlock() }
+        let occurredDuringTouch = scrollEventGeneration != generation
+        let occurredNearRelease = ProcessInfo.processInfo.systemUptime - lastScrollEventUptime < 0.12
+        return occurredDuringTouch || occurredNearRelease
+    }
+
+    private func wasScrollingRecently() -> Bool {
+        scrollStateLock.lock()
+        defer { scrollStateLock.unlock() }
+        return ProcessInfo.processInfo.systemUptime - lastScrollEventUptime < scrollStopTapWindow
+    }
+
+    private func recordSingleTap(at location: CGPoint, timestamp: TimeInterval) {
+        lastSingleTapTimestamp = timestamp
+        lastSingleTapLocation = location
+    }
+
+    /// macOS can emit the scroll-wheel event a few milliseconds after the final touch frame.
+    /// Hold an ordinary click briefly so that late event can veto it before anything is posted.
+    private func scheduleSingleClick(at location: CGPoint) {
+        let scrollGeneration = currentScrollGeneration()
+        pendingClickLock.lock()
+        pendingClickSerial &+= 1
+        let serial = pendingClickSerial
+        pendingSingleClick = (serial, location, scrollGeneration)
+        pendingClickLock.unlock()
+
+        DiagnosticLog.write("one-finger tap pending post-release scroll guard")
+        DispatchQueue.main.asyncAfter(deadline: .now() + postReleaseScrollGuardDelay) { [weak self] in
+            self?.deliverPendingSingleClick(serial: serial)
+        }
+    }
+
+    private func deliverPendingSingleClick(serial: UInt64) {
+        pendingClickLock.lock()
+        guard let pending = pendingSingleClick, pending.serial == serial else {
+            pendingClickLock.unlock()
+            return
+        }
+        pendingSingleClick = nil
+        pendingClickLock.unlock()
+
+        guard !nativeScrollOccurred(since: pending.scrollGeneration) else {
+            DiagnosticLog.write("pending tap rejected because macOS generated a post-release scroll event")
+            lastSingleTapTimestamp = nil
+            lastSingleTapLocation = nil
+            return
+        }
+
+        DiagnosticLog.write("one-finger tap recognized after scroll guard; clickCount=1")
+        onClickSynthesized?(pending.location, false, 1)
+    }
+
+    /// A fast second tap may arrive before the short guard delay expires. Deliver the first
+    /// click before starting selection mode so event order remains click, then held mouse-down.
+    private func flushPendingSingleClick() {
+        pendingClickLock.lock()
+        guard let pending = pendingSingleClick else {
+            pendingClickLock.unlock()
+            return
+        }
+        pendingSingleClick = nil
+        pendingClickLock.unlock()
+
+        guard !nativeScrollOccurred(since: pending.scrollGeneration) else {
+            DiagnosticLog.write("pending first tap rejected before double tap because of scrolling")
+            return
+        }
+        DiagnosticLog.write("pending first tap delivered before selection/drag")
+        onClickSynthesized?(pending.location, false, 1)
+    }
+
+    private func cancelPendingSingleClick() {
+        pendingClickLock.lock()
+        pendingSingleClick = nil
+        pendingClickSerial &+= 1
+        pendingClickLock.unlock()
+    }
+
+    private func beginSelectionDrag(at location: CGPoint) {
+        flushPendingSingleClick()
+        lastSingleTapTimestamp = nil
+        lastSingleTapLocation = nil
+        tapDetector.reset()
+        isSecondTapPending = true
+        pendingSecondTapLocation = location
+        DiagnosticLog.write("double tap second touch began; awaiting zoom or physical drag intent")
+    }
+
+    private func recognizeZoomSwipeIfNeeded(_ touch: MTTouch) {
+        guard touch.identifier == activeTouch else { return }
+
+        let deltaX = touch.normalized.position.x - touchStartX
+        let deltaY = touch.normalized.position.y - touchStartY
+        guard abs(deltaY) >= zoomSwipeThreshold,
+              abs(deltaY) > abs(deltaX) * 1.05 else { return }
+
+        // MultitouchSupport's normalized Y coordinate increases toward the front/top of the
+        // mouse. Per the requested mapping: swipe up zooms out; swipe down zooms in.
+        let zoomIn = deltaY < 0
+        cancelPendingSecondTap()
+        isZoomGestureActive = true
+        activeTouch = -1
+        tapDetector.reset()
+        DiagnosticLog.write(zoomIn
+            ? "double-tap hold + swipe down recognized; zoom in"
+            : "double-tap hold + swipe up recognized; zoom out")
+        onZoomGesture?(zoomIn)
+    }
+
+    /// Called by AppDelegate when the physical mouse moves while the second tap is held.
+    /// Returning the original cursor location lets it post mouse-down before transforming the
+    /// same movement event into a drag, preserving correct event order.
+    func promotePendingSecondTapToSelectionDrag(currentLocation: CGPoint) -> CGPoint? {
+        guard isSecondTapPending, let location = pendingSecondTapLocation else { return nil }
+        let distance = hypot(currentLocation.x - location.x, currentLocation.y - location.y)
+        guard distance >= selectionDragCursorThreshold else { return nil }
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
+        isSelectionDragging = true
+        DiagnosticLog.write("double tap hold + deliberate physical mouse movement; selection/drag mouse-down")
+        return location
+    }
+
+    private func finishPendingSecondTapAsDoubleClick() {
+        guard isSecondTapPending, let location = pendingSecondTapLocation else { return }
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
+        DiagnosticLog.write("double tap released without drag; second click sent")
+        onClickSynthesized?(location, false, 2)
+    }
+
+    private func cancelPendingSecondTap() {
+        isSecondTapPending = false
+        pendingSecondTapLocation = nil
+    }
+
+    private func finishSelectionDrag() {
+        guard isSelectionDragging else { return }
+        isSelectionDragging = false
+        let location = CGEvent(source: nil)?.location ?? CGPoint.zero
+        DiagnosticLog.write("double tap second touch released; selection/drag mouse-up")
+        onSelectionDragChanged?(location, false)
+    }
+
+    private func releaseSelectionDrag() {
+        cancelPendingSecondTap()
+        finishSelectionDrag()
+    }
+
+    private func resetTouchTracking() {
+        cancelPendingSingleClick()
+        twoFingerTapDetector.reset()
+        cancelSingleTouchTracking()
+        lastSingleTapTimestamp = nil
+        lastSingleTapLocation = nil
+        cancelPendingSecondTap()
+        isZoomGestureActive = false
+        touchStartedDuringScroll = false
+        suppressSingleTouchUntilLift = false
+    }
+
+    private func cancelSingleTouchTracking() {
+        tapDetector.reset()
+        activeTouch = -1
+        touchStartX = 0.0
+        touchStartY = 0.0
+        touchStartedDuringScroll = false
+    }
+
+    deinit {
+        stop()
+    }
+}
+
+private func touchCallback(device: Int32, touches: UnsafeMutablePointer<MTTouch>?, numTouches: Int32, timestamp: Double, frame: Int32) -> Int32 {
+    if let manager = MultitouchManager.sharedInstance, let touches = touches {
+        manager.processTouches(touches, numTouches: Int(numTouches), timestamp: timestamp)
+    }
+    return 0
+}

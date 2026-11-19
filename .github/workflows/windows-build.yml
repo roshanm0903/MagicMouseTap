@@ -1,0 +1,34 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main, windows-v1]
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows-build.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Run deterministic gesture tests
+        run: dotnet run --project windows/MagicMouseTap.Tests/MagicMouseTap.Tests.csproj -c Release
+      - name: Publish self-contained Windows app
+        run: >-
+          dotnet publish windows/MagicMouseTap.App/MagicMouseTap.App.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true
+          -o windows/artifacts/win-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MagicMouseTap-Windows-x64
+          path: windows/artifacts/win-x64/
